@@ -10,8 +10,8 @@ from PyQt5.QtWidgets import QAction, QApplication, QMenu, QSystemTrayIcon
 
 _DIR = Path(__file__).parent
 _IMAGES = _DIR / "images"
-_re_info = re.compile(
-    r"(\d{2}/\d{2}/\d{4} \d{2}:\d{2}:\d{2})\s+(\d{2}/\d{2}/\d{4} \d{2}:\d{2}:\d{2})\s+\S+@(\S+)"
+_re_expires = re.compile(
+    r"\d{2}/\d{2}/\d{4} \d{2}:\d{2}:\d{2}\s+(\d{2}/\d{2}/\d{4} \d{2}:\d{2}:\d{2})\s+\S+@\S+"
 )
 _icon_files = {
     "redhat.com": _IMAGES / "key-red.png",
@@ -19,26 +19,6 @@ _icon_files = {
     "other": _IMAGES / "key-yellow.png",
     "inactive": _IMAGES / "key-grey.png",
 }
-
-
-def tickets_from_klist():
-    tickets = {}
-    try:
-        result = subprocess.run(["klist", "-A"], capture_output=True, text=True)
-        output = result.stdout.strip()
-    except Exception as e:
-        print(f"Error: {e}")
-
-    for line in output.splitlines():
-        try:
-            ticket = Ticket(line)
-        except Exception:
-            pass
-            # print(f"error converting line to ticket: {line}")
-        else:
-            tickets[ticket.principal] = ticket
-
-    return tickets
 
 
 class Icon:
@@ -49,19 +29,43 @@ class Icon:
 
 
 class Ticket:
-    def __init__(self, line):
-        match = _re_info.match(line)
-        if match:
-            # start_str = match.group(1)
-            expires_str = match.group(2)
-            self.principal = match.group(3).lower()
+    def __init__(self, principal, expires=None, is_renewable=False):
+        self.principal = principal
+        self.expires = expires
+        self.is_renewable = is_renewable
 
-            self.expires = datetime.strptime(expires_str, "%m/%d/%Y %H:%M:%S")
-        else:
-            raise ValueError(f"Wrong input for Ticket: {line}")
+    @classmethod
+    def tickets_from_klist(cls):
+        tickets = {}
+        try:
+            result = subprocess.run(["klist", "-A"], capture_output=True, text=True)
+        except Exception as e:
+            print(f"Error: {e}")
+
+        output = result.stdout.strip()
+
+        for line in output.splitlines():
+            if line.startswith("Default principal:"):
+                principal = line.split(":")[1].strip()
+                tickets[principal] = cls(principal)
+            elif m := re.match(_re_expires, line):
+                tickets[principal].expires = datetime.strptime(
+                    m.group(1), "%m/%d/%Y %H:%M:%S"
+                )
+            elif "renew until" in line:
+                tickets[principal].is_renewable = True
+
+        return tickets
 
     def is_active(self):
         return self.expires > datetime.now()
+
+    def renew_if_possible(self):
+        if self.is_renewable and self.is_active:
+            try:
+                subprocess.run(["kinit", "-R", self.principal])
+            except Exception as e:
+                print(f"ERROR: Cannot renew {self}, {e}")
 
 
 class TrayApp:
@@ -69,7 +73,7 @@ class TrayApp:
         self.app = QApplication(sys.argv)
         self.icons = {}
 
-        self.tickets = tickets_from_klist()
+        self.tickets = Ticket.tickets_from_klist()
 
         for principal, ticket in self.tickets.items():
             self.add_icon(ticket)
@@ -77,18 +81,20 @@ class TrayApp:
         # Run the command periodically
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_icons)
-        self.timer.start(2000)
+        self.timer.start(60000)
 
     def add_icon(self, ticket):
         icon = Icon(QSystemTrayIcon(self.get_icon_for_ticket(ticket)))
 
         icon.menu = QMenu()
+        icon.info = QAction(f"Principal: {ticket.principal}")
+        icon.expires = QAction(f"Expires: {ticket.expires}")
         exit_action = QAction("Exit", self.app)
         exit_action.triggered.connect(self.exit_app)
-        icon.expires = QAction(f"Expires: {ticket.expires}")
-        # expires.setEnabled(False)
-        icon.menu.addAction(exit_action)
+
+        icon.menu.addAction(icon.info)
         icon.menu.addAction(icon.expires)
+        icon.menu.addAction(exit_action)
         icon.object.setContextMenu(icon.menu)
 
         icon.object.show()
@@ -98,17 +104,14 @@ class TrayApp:
     @staticmethod
     def get_icon_for_ticket(ticket):
         if ticket.is_active():
-            if ticket.principal in _icon_files:
-                icon_name = _icon_files[ticket.principal]
-            else:
-                icon_name = _icon_files["other"]
-        else:
-            icon_name = _icon_files["inactive"]
-
-        return QIcon(str(_DIR / icon_name))
+            for domain, icon_name in _icon_files.items():
+                if domain in ticket.principal.lower():
+                    return QIcon(str(_DIR / icon_name))
+            return QIcon(str(_DIR / _icon_files["other"]))
+        return QIcon(str(_DIR / icon_name["inactive"]))
 
     def update_icons(self):
-        self.tickets = tickets_from_klist()
+        self.tickets = Ticket.tickets_from_klist()
 
         for principal, icon in self.icons.items():
             if principal not in self.tickets:
@@ -117,6 +120,7 @@ class TrayApp:
                 icon.object.show()
 
         for principal, ticket in self.tickets.items():
+            ticket.renew_if_possible()
             if principal not in self.icons:
                 self.add_icon(ticket)
             self.icons[principal].object.setIcon(self.get_icon_for_ticket(ticket))
