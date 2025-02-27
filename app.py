@@ -108,7 +108,7 @@ class TrayApp:
                 if domain in ticket.principal.lower():
                     return QIcon(str(_DIR / icon_name))
             return QIcon(str(_DIR / _icon_files["other"]))
-        return QIcon(str(_DIR / icon_name["inactive"]))
+        return QIcon(str(_DIR / _icon_files["inactive"]))
 
     def update_icons(self):
         self.tickets = Ticket.tickets_from_klist()
